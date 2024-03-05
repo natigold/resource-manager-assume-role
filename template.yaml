@@ -1,0 +1,201 @@
+Transform: AWS::Serverless-2016-10-31
+Parameters:
+  UserPoolDomainName:
+    Type: String
+    Description: Domain name for Cognito user pool
+    Default: resource-manager
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+      MfaConfiguration: "OFF"
+      UsernameAttributes: 
+        - email
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref UserPoolDomainName
+      UserPoolId: !Ref UserPool
+
+  UserPoolAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Ref UserPoolDomain
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+      AllowedOAuthFlowsUserPoolClient: true
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      CallbackURLs:
+        - http://localhost
+        - https://oauth.pstmn.io/v1/callback
+      AllowedOAuthFlows:
+        - implicit     
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthScopes:
+        - email
+        - openid
+
+  AnalystsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CustomAnalystsRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonAthenaFullAccess
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt ProvisionResourcesFunctionRole.Arn
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Federated: 
+                - cognito-identity.amazonaws.com
+            Action: 
+              - sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: 
+                'cognito-identity.amazonaws.com:aud': !Ref UserPool
+
+  DataScientistsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: CustomDataScientistsRole
+      Policies:
+        - PolicyName: DSSageMakerAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:ListNotebookInstances
+                Resource: '*'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt ProvisionResourcesFunctionRole.Arn
+            Action:
+              - sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Federated: 
+                - cognito-identity.amazonaws.com
+            Action: 
+              - sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals: 
+                'cognito-identity.amazonaws.com:aud': !Ref UserPool
+
+  ExecuteApiPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ExecuteApiPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - execute-api:Invoke
+            Resource:
+              - !Sub
+                - arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ResourceName}/*
+                - ResourceName: !Ref ResourceManagerApi
+      Roles:
+        - !Ref AnalystsRole
+        - !Ref DataScientistsRole
+
+  DataScientistsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: User group for data scientists
+      GroupName: DataScientists
+      RoleArn: !GetAtt DataScientistsRole.Arn
+      UserPoolId: !Ref UserPool
+
+  AnalystsGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      Description: User group for analysts
+      GroupName: Analysts
+      RoleArn: !GetAtt AnalystsRole.Arn
+      UserPoolId: !Ref UserPool
+
+  ResourceManagerApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub
+        - ${ResourceName} From Stack ${AWS::StackName}
+        - ResourceName: ResourceManagerApi
+      StageName: Prod
+      DefinitionBody:
+        openapi: '3.0'
+        info: {}
+        paths:
+          /provision:
+            post:
+              x-amazon-apigateway-integration:
+                httpMethod: POST
+                type: aws_proxy
+                uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProvisionResourcesFunction.Arn}/invocations
+              responses: {}
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+      Auth:
+        DefaultAuthorizer: ResourceManagerUserPool
+        Authorizers:
+          ResourceManagerUserPool:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+      Cors: '''*'''
+
+  ProvisionResourcesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: !Sub
+        - Stack ${AWS::StackName} Function ${ResourceName}
+        - ResourceName: ProvisionResourcesFunction
+      MemorySize: 512
+      Timeout: 30
+      Tracing: Active
+      Events:
+        ResourceManagerApiPOSTprovision:
+          Type: Api
+          Properties:
+            Path: /provision
+            Method: POST
+            RestApiId: !Ref ResourceManagerApi
+      LoggingConfig:
+        LogGroup: !Ref ProvisionResourcesFunctionLogGroup
+        LogFormat: JSON
+      CodeUri: src/handlers/provisionResources
+      Runtime: nodejs20.x
+      Handler: index.handler
+
+  ProvisionResourcesFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    Properties:
+      LogGroupName: ResourceManagerLogGroup
+
+Outputs:
+  ResourceManagerApi:
+    Description: API Gateway endpoint URL for Prod stage for Resource Manager API
+    Value: !Sub https://${ResourceManagerApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/provision

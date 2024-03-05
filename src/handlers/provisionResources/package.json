@@ -1,0 +1,9 @@
+{
+  "name": "function",
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-athena": "^3.523.0",
+    "@aws-sdk/client-sagemaker": "^3.523.0",
+    "@aws-sdk/client-sts": "^3.523.0"
+  }
+}
